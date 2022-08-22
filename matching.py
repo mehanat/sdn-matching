@@ -88,6 +88,7 @@ def score_transaction(listFromClient, sanctionData, name_matching_method, addres
     #Scoring names
     start = time.perf_counter()
     res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
+    global i
     i = 0
 
     #Scoring addresses
@@ -156,6 +157,7 @@ def score_physical(listFromClient, sanctionData, name_matching_method, address_m
     #Scoring names
     start = time.perf_counter()
     res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
+    global i
     i = 0
 
     #Scoring dates
@@ -262,6 +264,7 @@ def score_moral(listFromClient, sanctionData, name_matching_method, address_matc
     #Scoring names
     start = time.perf_counter()
     res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
+    global i
     i = 0
 
         #Scoring addresses
@@ -379,8 +382,9 @@ def score_customers(listFromClient, sanctionData, name_matching_method='bleu', a
     #Scoring names
     start = time.perf_counter()
     res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
+    global i
     i = 0
-    
+
     #Scoring addresses
     if address_matching_method == 'exact_match':
         res['scored'] = False
