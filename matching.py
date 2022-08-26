@@ -11,6 +11,7 @@ import pandas as pd
 #import modin.pandas as pd
 
 import time
+import math
 
 import itertools
 
@@ -71,10 +72,8 @@ def compare_addresses(res, address_matching_method, **kwargs):
         return 0
 
 
-i =  0
 def compare_names_with_progress(full_name_client, full_name_sdn, name_matching_method, total, start):
     global i
-    i += 1
     if i % 5000 == 0:
         s = i/total
         sec_passed = time.perf_counter() - start
@@ -82,440 +81,339 @@ def compare_names_with_progress(full_name_client, full_name_sdn, name_matching_m
         print(f"{i}/{total} ({s * 100:.1f}%)  Time passed={seconds_to_str(sec_passed)}  ; Time remaining={seconds_to_str(sec_remaining)} ")
     return compare_names(full_name_client, full_name_sdn, name_matching_method=name_matching_method)
 
-def score_transaction(listFromClient, sanctionData, name_matching_method, address_matching_method):
-    res = pd.merge(listFromClient, sanctionData, how='cross')
-    
-    #Scoring names
-    start = time.perf_counter()
-    res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
-    global i
-    i = 0
 
-    #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_Address']
+def scoring_name(listFromClient, sanctionData, name_matching_method, sep):
+    names_client = listFromClient.assign(matching_name_client=listFromClient['Name'].str.split(sep)).explode('matching_name_client')
+    names_sdn = sanctionData.assign(matching_name_sdn=sanctionData['Name'].str.split(sep)).explode('matching_name_sdn')
 
-    res = res.drop_duplicates()
+    res = pd.merge(names_client, names_sdn, how='cross')
 
-    res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
-    
-    return res
+    res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names(x["matching_name_client"], x["matching_name_sdn"], name_matching_method=name_matching_method), axis=1))
 
 
-def score_physical(listFromClient, sanctionData, name_matching_method, address_matching_method):
-    #listFromClient['DateOfBirth'] = listFromClient['DateOfBirth'].str.replace('circa ', '')
-    sanctionData['dateOfBirth'] = sanctionData['dateOfBirth'].str.replace('circa', 'to')
-    sanctionData['isRange'] = sanctionData['dateOfBirth'].str.contains('to').fillna(False)
-    sanctionData[['fromDoB', 'toDoB']] = sanctionData['dateOfBirth'].str.split('to ', n=2, expand=True)
-    sanctionData = sanctionData.drop(columns=['dateOfBirth'])
-    
-    sanctionData['fromDoB'] = pd.to_datetime(sanctionData['fromDoB'], infer_datetime_format=True)
-    sanctionData['toDoB'] = pd.to_datetime(sanctionData['toDoB'], infer_datetime_format=True)
-    listFromClient['DoB'] = pd.to_datetime(listFromClient['DoB'], infer_datetime_format=True)
+    res = res.rename(columns={'Name_x': 'name_client(multi_value)',
 
-    res = pd.merge(listFromClient, sanctionData, how='cross')
+                                          'Name_y': 'name_sdn(multi_value)'})
 
-    #Scoring names
-    start = time.perf_counter()
-    res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
-    global i
-    i = 0
+    res = res[['id_client', 'id_sdn', 'name_client(multi_value)', 'name_sdn(multi_value)', 'matching_name_client', 
 
-    #Scoring dates
-    res['l_year']   = res['DoB'].dt.year
-    res['l_month']  = res['DoB'].dt.month
-    res['l_day']    = res['DoB'].dt.day
+                           'matching_name_sdn', 'Name_Matching_%', 'score_Name']]
+
+    return res.loc[res.groupby(['id_client', 'id_sdn'])['score_Name'].idxmax()]
+
+
+def scoring_dob(listFromClient, sanctionData, sep):
+    dob_client = listFromClient.assign(matching_DoB_client=listFromClient['DoB'].str.split(sep)).explode('matching_DoB_client')
+    dob_sdn = sanctionData.assign(matching_DoB_sdn=sanctionData['DoB'].str.split(sep)).explode('matching_DoB_sdn')
+
+    dob_sdn['matching_DoB_sdn'] = dob_sdn['matching_DoB_sdn'].str.replace('circa', 'to')
+    dob_sdn['isRange'] = dob_sdn['matching_DoB_sdn'].str.contains('to').fillna(False)
+    dob_sdn[['fromDoB', 'toDoB']] = dob_sdn['matching_DoB_sdn'].str.split('to ', n=1, expand=True).reindex(range(2), axis=1)
+            
+    dob_sdn['fromDoB'] = pd.to_datetime(dob_sdn['fromDoB'], infer_datetime_format=True)
+    dob_sdn['toDoB'] = pd.to_datetime(dob_sdn['toDoB'], infer_datetime_format=True)
+    dob_client['DoB_client'] = pd.to_datetime(dob_client['matching_DoB_client'], infer_datetime_format=True)
+
+    res = pd.merge(dob_client, dob_sdn, how='cross')
+
+    res['l_year']   = res['DoB_client'].dt.year
+    res['l_month']  = res['DoB_client'].dt.month
+    res['l_day']    = res['DoB_client'].dt.day
     res['rf_year']  = res['fromDoB'].dt.year
     res['rf_month'] = res['fromDoB'].dt.month
     res['rf_day']   = res['fromDoB'].dt.day
     res['rt_year']  = res['toDoB'].dt.year
     res['rt_month'] = res['toDoB'].dt.month
     res['rt_day']   = res['toDoB'].dt.day
-    
-    # Scoring
+            
+            # Scoring
     res['scored'] = False
     fields = ['score_DoB', 'scored']
-    # Case when DoB in sanction data is not a range ===
-    ## 100% DoB match
-    res.loc[(res['DoB'] == res['fromDoB']) &
-            ~res['isRange'] & 
-            ~res['scored'], fields] = 400, True 
-    ## Year and Month match only
+            # Case when DoB in sanction data is not a range ===
+            ## 100% DoB match
+    res.loc[(res['DoB_client'] == res['fromDoB']) &
+                    ~res['isRange'] & 
+                    ~res['scored'], fields] = 400, True 
+            ## Year and Month match only
     res.loc[(res['l_year'] == res['rf_year']) & 
-            (res['l_month'] == res['rf_month']) &
-            ~res['isRange'] &
-            ~res['scored'], fields] = 250, True
-    ## Year match only
+                    (res['l_month'] == res['rf_month']) &
+                    ~res['isRange'] &
+                    ~res['scored'], fields] = 250, True
+            ## Year match only
     res.loc[(res['l_year'] == res['rf_year']) &
-            ~res['isRange'] &
-            ~res['scored'], fields] = 200, True
-    ## Dates within 2 years of each other
-    res.loc[(np.abs(res['fromDoB'] - res['DoB']) /  np.timedelta64(1, 'Y') < 2) &
-            ~res['isRange'] &
-            ~res['scored'], fields] = 100, True
-    ## More than 2 years difference in DoB between bank and World-Check’ information
-    res.loc[(np.abs(res['fromDoB'] - res['DoB']) /  np.timedelta64(1, 'Y') >= 2) &
-            ~res['isRange'] &
-            ~res['scored'], fields] = -200, True
-    ## Date of Birth not recorded on Bank or World-Check’ list
+                    ~res['isRange'] &
+                    ~res['scored'], fields] = 200, True
+            ## Dates within 2 years of each other
+    res.loc[(np.abs(res['fromDoB'] - res['DoB_client']) /  np.timedelta64(1, 'Y') < 2) &
+                    ~res['isRange'] &
+                    ~res['scored'], fields] = 100, True
+            ## More than 2 years difference in DoB between bank and World-Check’ information
+    res.loc[(np.abs(res['fromDoB'] - res['DoB_client']) /  np.timedelta64(1, 'Y') >= 2) &
+                    ~res['isRange'] &
+                    ~res['scored'], fields] = -200, True
+            ## Date of Birth not recorded on Bank or World-Check’ list
     res.loc[~res['isRange'] & 
-            ~res['scored'], fields] = 0, True 
-    # === Case when DoB in sanction data is a range ===
-    ## Date is before ('circa' case)
-    res.loc[(res['DoB'] <= res['toDoB']) &
-            (res['fromDoB'] is None) &
-            ~res['scored'], fields] = 100, True
-    ## Date is in range
-    res.loc[(res['DoB'] <= res['toDoB']) &
-            (res['fromDoB'] <= res['DoB']) &
-            ~res['scored'], fields] = 150, True
-    ## Date is not in range
+                    ~res['scored'], fields] = 0, True 
+            # === Case when DoB in sanction data is a range ===
+            ## Date is before ('circa' case)
+    res.loc[(res['DoB_client'] <= res['toDoB']) &
+                    (res['fromDoB'].isna()) &
+                    ~res['scored'], fields] = 100, True
+            ## Date is in range
+    res.loc[(res['DoB_client'] <= res['toDoB']) &
+                    (res['fromDoB'] <= res['DoB_client']) &
+                    ~res['scored'], fields] = 150, True
+            ## Date is not in range
     res.loc[~res['scored'], fields] = 0, True
 
-    #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_DoB'] + res['score_Address']
 
-    res = res.drop_duplicates()
-    
-    return res
+    res = res.rename(columns={'DoB_x': 'DoB_client(multi_value)',
+                                          'DoB_y': 'DoB_sdn(multi_value)'})
+    res = res[['id_client', 'id_sdn', 'DoB_client(multi_value)', 'DoB_sdn(multi_value)', 'matching_DoB_client', 
+                           'matching_DoB_sdn', 'score_DoB']]
 
-def score_moral(listFromClient, sanctionData, name_matching_method, address_matching_method):
-    res = pd.merge(listFromClient, sanctionData, how='cross')
+    return res.loc[res.groupby(['id_client', 'id_sdn'])['score_DoB'].idxmax()]
 
-    #Scoring names
+def scoring_address(listFromClient, sanctionData, sep):
+    address_client = listFromClient.assign(matching_address_client=listFromClient['Address'].str.split(sep)).explode('matching_address_client')
+    address_client = address_client.assign(matching_country_client=address_client['Country'].str.split(sep)).explode('matching_country_client')
+    address_sdn = sanctionData.assign(matching_address_sdn=sanctionData['Address'].str.split(sep)).explode('matching_address_sdn')
+    address_sdn = address_sdn.assign(matching_country_sdn=address_sdn['Country'].str.split(sep)).explode('matching_country_sdn')
+
+    res = pd.merge(address_client, address_sdn, how='cross')
+
+            #Scoring addresses
+    res['scored'] = False
+    fields = ['score_Address', 'scored']
+            #Exact math of address and country
+    res.loc[(res['matching_address_client'] == res['matching_address_sdn']) &
+                    (res['matching_country_client'] == res['matching_country_sdn']) &
+                    ~res['scored'], fields] = 500, True
+            #Match of address only
+    res.loc[(res['matching_address_client'] == res['matching_address_sdn']) &
+                    ~res['scored'], fields] = 200, True
+            #Match of country only
+    res.loc[(res['matching_country_client'] == res['matching_country_sdn']) &
+                    ~res['scored'], fields] = 300, True
+            #No data
+    res.loc[(res['matching_country_client'].isna()) |
+                    (res['matching_country_sdn'].isna()) &
+                    ~res['scored'], fields] = 0, True
+            #No match
+    res.loc[~res['scored'], fields] = -200, True
+
+            
+    res = res.rename(columns={'Address_x': 'Address_client(multi_value)',
+                                          'Address_y': 'Address_sdn(multi_value)',
+                                          'Country_x': 'Country_client(multi_value)',
+                                          'Country_y': 'Country_sdn(multi_value)'})
+    res = res[['id_client', 'id_sdn', 'Address_client(multi_value)', 'Address_sdn(multi_value)', 'matching_address_client', 
+                           'matching_address_sdn', 'Country_client(multi_value)', 'Country_sdn(multi_value)', 'matching_country_client',
+                           'matching_country_sdn', 'score_Address']]
+
+    return res.loc[res.groupby(['id_client', 'id_sdn'])['score_Address'].idxmax()]
+
+def score_transaction(listFromClient, sanctionData, name_matching_method, address_matching_method, scoreTrsh, mini_batch, sep):
+    res_score = pd.DataFrame()
     start = time.perf_counter()
-    res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
-    global i
     i = 0
+    total = math.ceil(len(sanctionData) / mini_batch) * math.ceil(len(listFromClient) / mini_batch)
 
-        #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_Address']
+    sanctionData = sanctionData.rename(columns={'full_name_sdn': 'Name', 'uid': 'id_sdn', 'address':'Address', 'city':'City', 'country':'Country'})
+    listFromClient = listFromClient.rename(columns={'UniqueID': 'id_client'})
 
-    res = res.drop_duplicates()
+    print(f"{i}/{total} (0%) ")
+    for batch_sanct in range(0, len(sanctionData), mini_batch):
+        for batch_cl in range(0, len(listFromClient), mini_batch):
+            sanctionData_sub = sanctionData[batch_sanct:batch_sanct+mini_batch]
+            listFromClient_sub = listFromClient[batch_cl:batch_cl+mini_batch]
 
-    res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
-    
-    return res    #Scoring names
-    res = pd.merge(listFromClient, sanctionData, how='cross')
+            client_names_data = listFromClient_sub[['id_client', 'Name']]
+            sdn_names_data = sanctionData_sub[['id_sdn', 'Name']]
 
-    res["score_Name"] = res.apply(lambda x: compare_names_with_progress(x, name_matching_method, res.shape[0]), axis=1)
+            client_addresses_data = listFromClient_sub[['id_client', 'Address', 'Country']]
+            sdn_addresses_data = sanctionData_sub[['id_sdn', 'Address', 'City', 'Country']]
 
-        #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_Address']
+            names_score = scoring_name(client_names_data, sdn_names_data, name_matching_method = name_matching_method, sep = sep)
+            #print('names_score', names_score.shape)
 
-    res = res[['id_client', 'recordID_sdn', 'uid', 'full_name_client', 'full_name_sdn', 'address_x', 'address_y', 'country_x',
-               'country_y', 'score_Name', 'score_Address', 'Overall_Score']]
+            addresses_scores = scoring_address(client_addresses_data, sdn_addresses_data, sep = sep)
+            #print('addresses_scores', names_score.shape)
 
-    res = res.drop_duplicates()
+            res = pd.merge(names_score, addresses_scores, how='outer', on = ['id_client', 'id_sdn'])
 
-    res = res.rename(columns={'uid': 'uid_sdn',
-                              'address_x': 'address_client',
-                              'address_y': 'address_sdn',
-                              'country_x': 'country_client',
-                              'country_y': 'country_sdn'})
-    
-    return res
+            res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
 
-def score_customers(listFromClient, sanctionData, name_matching_method='bleu', address_mathing='exact_match', address_matching_method='bleu'):
-    
-    res = pd.merge(listFromClient, sanctionData, how='cross')
+            res['Overall_Score'] = res['score_Name'] + res['score_Address']
 
-    #Scoring names
+            res = res.query(f'Overall_Score >= {scoreTrsh}')
+            res_score = pd.concat([res_score, res])
+
+            i+=1
+            s = i/total
+            sec_passed = time.perf_counter() - start
+            sec_remaining = (sec_passed / s) * (1 - s)
+            print(f"{i}/{total} ({s * 100:.1f}%)  Time passed={seconds_to_str(sec_passed)}  ; Time remaining={seconds_to_str(sec_remaining)} ")
+    res_score = res_score.drop_duplicates()
+    return res_score
+
+def score_physical(listFromClient, sanctionData, name_matching_method, address_matching_method, scoreTrsh, mini_batch, sep):
+    res_score = pd.DataFrame()
     start = time.perf_counter()
-    res['Name_Matching_%'], res['score_Name'] = zip(*res.apply(lambda x: compare_names_with_progress(x["full_name_client"], x["full_name_sdn"], name_matching_method=name_matching_method, total = res.shape[0], start = start), axis=1))
-    global i
     i = 0
+    total = math.ceil(len(sanctionData) / mini_batch) * math.ceil(len(listFromClient) / mini_batch)
 
-    #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_Address']
+    sanctionData = sanctionData.rename(columns={'full_name_sdn': 'Name', 'uid': 'id_sdn', 'address':'Address', 'city':'City', 'country':'Country', 'dateOfBirth':'DoB'})
+    listFromClient = listFromClient.rename(columns={'UniqueID': 'id_client', 'DateOfBirth':'DoB'})
 
-    res = res.drop_duplicates()
+    print(f"{i}/{total} (0%) ")
+    for batch_sanct in range(0, len(sanctionData), mini_batch):
+        for batch_cl in range(0, len(listFromClient), mini_batch):
+            sanctionData_sub = sanctionData[batch_sanct:batch_sanct+mini_batch]
+            listFromClient_sub = listFromClient[batch_cl:batch_cl+mini_batch]
 
-    res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
+            client_names_data = listFromClient_sub[['id_client', 'Name']]
+            sdn_names_data = sanctionData_sub[['id_sdn', 'Name']]
 
-    return res    #Scoring names
-    res = pd.merge(listFromClient, sanctionData, how='cross')
+            client_addresses_data = listFromClient_sub[['id_client', 'Address', 'Country']]
+            sdn_addresses_data = sanctionData_sub[['id_sdn', 'Address', 'City', 'Country']]
 
-    res["score_Name"] = res.apply(lambda x: compare_names_with_progress(x, name_matching_method, res.shape[0]), axis=1)
+            names_score = scoring_name(client_names_data, sdn_names_data, name_matching_method = name_matching_method, sep = sep)
+            #print('names_score', names_score.shape)
 
-    #Scoring addresses
-    if address_matching_method == 'exact_match':
-        res['scored'] = False
-        fields = ['score_Address', 'scored']
-        #Exact math of address, city and country
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 500, True
-        #Match of address and city only
-        res.loc[(res['address_x'] == res['address_y']) &
-                #(res['city_x'] == res['city_y']) &
-                ~res['scored'], fields] = 100, True
-        #Match of address and country only
-        res.loc[(res['address_x'] == res['address_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 400, True
-        #Match of city and country only
-        res.loc[#(res['city_x'] == res['city_y']) &
-                (res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 300, True
-        #Match of address only
-        res.loc[(res['address_x'] == res['address_y']) &
-                ~res['scored'], fields] = 0, True
-        #Match of city only
-        #res.loc[(res['city_x'] == res['city_y']) &
-                #~res['scored'], fields] = -100, True
-        #Match of country only
-        res.loc[(res['country_x'] == res['country_y']) &
-                ~res['scored'], fields] = 200, True
-        #No data
-        res.loc[(res['country_x'].isna()) |
-                (res['country_y'].isna()) &
-                ~res['scored'], fields] = 0, True
-        #No match
-        res.loc[~res['scored'], fields] = -200, True
-    #elif address_matching_method == 'fuzzy_match':
-        #res["score_Address"] = res.apply(lambda x: compare_addresses(x, address_matching_method=address_matching_method), axis=1)
-    else:
-        raise TypeError(f'"{address_matching_method}" is an invalid keyword argument for score()')
-    
-    res['Overall_Score'] = res['score_Name'] + res['score_Address']
+            addresses_scores = scoring_address(client_addresses_data, sdn_addresses_data, sep = sep)
+            #print('addresses_scores', names_score.shape)
 
-    res = res[['id_client', 'recordID_sdn', 'uid', 'full_name_client', 'full_name_sdn', 'address_x', 'address_y', 'country_x',
-               'country_y', 'score_Name', 'score_Address', 'Overall_Score']]
+            client_dates_data = listFromClient_sub[['id_client', 'DoB']]
+            sdn_dates_data = sanctionData_sub[['id_sdn', 'DoB']]
 
-    res = res.drop_duplicates()
+            dob_scores = scoring_dob(client_dates_data, sdn_dates_data, sep = sep)
 
-    res = res.rename(columns={'uid': 'uid_sdn',
-                              'address_x': 'address_client',
-                              'address_y': 'address_sdn',
-                              'country_x': 'country_client',
-                              'country_y': 'country_sdn'})
-    
-    return res
+            res = pd.merge(names_score, addresses_scores, how='outer', on = ['id_client', 'id_sdn'])
+            res = pd.merge(res, dob_scores, how='outer', on = ['id_client', 'id_sdn'])
 
-def score(listFromClient, sanctionData, input_type, name_matching_method='bleu', address_matching_method = 'exact_match', scoreTrsh = 800, sep = '¦'):
-    listFromClient = listFromClient.assign(full_name_client=listFromClient['Name'].str.split(sep)).explode('full_name_client')
-    listFromClient = listFromClient.assign(address=listFromClient['Address'].str.split(sep)).explode('address')
-    listFromClient = listFromClient.assign(country=listFromClient['Country'].str.split(sep)).explode('country')
-    try:
-        listFromClient = listFromClient.assign(DoB=listFromClient.DateOfBirth.str.split(sep)).explode('DoB')
-    except:
-        pass
-    
+            res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
+
+            res['Overall_Score'] = res['score_Name'] + res['score_Address'] + res['score_DoB']
+
+            res = res.query(f'Overall_Score >= {scoreTrsh}')
+            res_score = pd.concat([res_score, res])
+
+            i+=1
+            s = i/total
+            sec_passed = time.perf_counter() - start
+            sec_remaining = (sec_passed / s) * (1 - s)
+            print(f"{i}/{total} ({s * 100:.1f}%)  Time passed={seconds_to_str(sec_passed)}  ; Time remaining={seconds_to_str(sec_remaining)} ")
+    res_score = res_score.drop_duplicates()
+    return res_score
+
+def score_moral(listFromClient, sanctionData, name_matching_method, address_matching_method, scoreTrsh, mini_batch, sep):
+    res_score = pd.DataFrame()
+    start = time.perf_counter()
+    i = 0
+    total = math.ceil(len(sanctionData) / mini_batch) * math.ceil(len(listFromClient) / mini_batch)
+
+    sanctionData = sanctionData.rename(columns={'full_name_sdn': 'Name', 'uid': 'id_sdn', 'address':'Address', 'city':'City', 'country':'Country'})
+    listFromClient = listFromClient.rename(columns={'UniqueID': 'id_client'})
+    print(f"{i}/{total} (0%) ")
+    for batch_sanct in range(0, len(sanctionData), mini_batch):
+        for batch_cl in range(0, len(listFromClient), mini_batch):
+            sanctionData_sub = sanctionData[batch_sanct:batch_sanct+mini_batch]
+            listFromClient_sub = listFromClient[batch_cl:batch_cl+mini_batch]
+
+            client_names_data = listFromClient_sub[['id_client', 'Name']]
+            sdn_names_data = sanctionData_sub[['id_sdn', 'Name']]
+
+            client_addresses_data = listFromClient_sub[['id_client', 'Address', 'Country']]
+            sdn_addresses_data = sanctionData_sub[['id_sdn', 'Address', 'City', 'Country']]
+
+            names_score = scoring_name(client_names_data, sdn_names_data, name_matching_method = name_matching_method, sep = sep)
+            #print('names_score', names_score.shape)
+
+            addresses_scores = scoring_address(client_addresses_data, sdn_addresses_data, sep = sep)
+            #print('addresses_scores', names_score.shape)
+
+            res = pd.merge(names_score, addresses_scores, how='outer', on = ['id_client', 'id_sdn'])
+
+            res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
+
+            res['Overall_Score'] = res['score_Name'] + res['score_Address']
+
+            res = res.query(f'Overall_Score >= {scoreTrsh}')
+            res_score = pd.concat([res_score, res])
+
+            i+=1
+            s = i/total
+            sec_passed = time.perf_counter() - start
+            sec_remaining = (sec_passed / s) * (1 - s)
+            print(f"{i}/{total} ({s * 100:.1f}%)  Time passed={seconds_to_str(sec_passed)}  ; Time remaining={seconds_to_str(sec_remaining)} ")
+    res_score = res_score.drop_duplicates()
+    return res_score
+
+def score_customers(listFromClient, sanctionData, name_matching_method, address_matching_method, scoreTrsh, mini_batch, sep):
+    res_score = pd.DataFrame()
+    start = time.perf_counter()
+    i = 0
+    total = math.ceil(len(sanctionData) / mini_batch) * math.ceil(len(listFromClient) / mini_batch)
+
+    sanctionData = sanctionData.rename(columns={'full_name_sdn': 'Name', 'uid': 'id_sdn', 'address':'Address', 'city':'City', 'country':'Country'})
+    listFromClient = listFromClient.rename(columns={'UniqueID': 'id_client'})
+    print(f"{i}/{total} (0%) ")
+    for batch_sanct in range(0, len(sanctionData), mini_batch):
+        for batch_cl in range(0, len(listFromClient), mini_batch):
+            sanctionData_sub = sanctionData[batch_sanct:batch_sanct+mini_batch]
+            listFromClient_sub = listFromClient[batch_cl:batch_cl+mini_batch]
+
+            client_names_data = listFromClient_sub[['id_client', 'Name']]
+            sdn_names_data = sanctionData_sub[['id_sdn', 'Name']]
+
+            client_addresses_data = listFromClient_sub[['id_client', 'Address', 'Country']]
+            sdn_addresses_data = sanctionData_sub[['id_sdn', 'Address', 'City', 'Country']]
+
+            names_score = scoring_name(client_names_data, sdn_names_data, name_matching_method = name_matching_method, sep = sep)
+            #print('names_score', names_score.shape)
+
+            addresses_scores = scoring_address(client_addresses_data, sdn_addresses_data, sep = sep)
+            #print('addresses_scores', names_score.shape)
+
+            res = pd.merge(names_score, addresses_scores, how='outer', on = ['id_client', 'id_sdn'])
+
+            res[['DoB', 'fromDoB', 'score_DoB']] = np.NaN
+
+            res['Overall_Score'] = res['score_Name'] + res['score_Address']
+
+            res = res.query(f'Overall_Score >= {scoreTrsh}')
+            res_score = pd.concat([res_score, res])
+
+            i+=1
+            s = i/total
+            sec_passed = time.perf_counter() - start
+            sec_remaining = (sec_passed / s) * (1 - s)
+            print(f"{i}/{total} ({s * 100:.1f}%)  Time passed={seconds_to_str(sec_passed)}  ; Time remaining={seconds_to_str(sec_remaining)} ")
+    res_score = res_score.drop_duplicates()
+    return res_score
+
+def score(listFromClient, sanctionData, input_type, name_matching_method='bleu', address_matching_method = 'exact_match', mini_batch=10000, scoreTrsh = 800, sep='¦'):
+    #todo
+    sanctionData['sanction_list_name'] = 'SDN'
+    sdn_list_mapping = sanctionData[['uid', 'sanction_list_name']]
+    sdn_list_mapping = sdn_list_mapping.drop_duplicates()
+    sanctionData = sanctionData.drop('sanction_list_name', axis = 1)
+
     if input_type == 'Transaction Data':
-        res = score_transaction(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method)
+        res = score_transaction(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method, scoreTrsh=scoreTrsh, mini_batch=mini_batch, sep=sep)
     elif input_type == 'Physical Person - Individuals':
-        res = score_physical(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method)
+        res = score_physical(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method, scoreTrsh=scoreTrsh, mini_batch=mini_batch, sep=sep)
     elif input_type == 'Moral Person - Companies':
-        res = score_moral(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method)
+        res = score_moral(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method, scoreTrsh=scoreTrsh, mini_batch=mini_batch, sep=sep)
     elif input_type == 'Customers (mix PP MP)':
-        res = score_customers(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method)
+        res = score_customers(listFromClient, sanctionData, name_matching_method=name_matching_method, address_matching_method = address_matching_method, scoreTrsh=scoreTrsh, mini_batch=mini_batch, sep=sep)
     else:
         raise TypeError(f'"{input_type}" is an invalid keyword argument for score()')
 
-    if 'DateOfBirth' not in res.columns:
-        res['DateOfBirth'] = np.nan
-    res = res.rename(columns={'uid': 'uid_sdn',
+    if input_type != 'Physical Person - Individuals':
+        res[['DoB_client(multi_value)', 'DoB_sdn(multi_value)', 'matching_DoB_client', 'matching_DoB_sdn']] = np.NaN
+    '''res = res.rename(columns={'uid': 'uid_sdn',
                               'Name': 'name_client',
                               'full_name_sdn': 'name_sdn',
                               'Address': 'address_client',
@@ -524,10 +422,31 @@ def score(listFromClient, sanctionData, input_type, name_matching_method='bleu',
                               'city_y': 'city_sdn',
                               'Country': 'country_client',
                               'country_y': 'country_sdn',
-                              'DateOfBirth': 'DoB_client',
-                              'fromDoB': 'DoB_sdn'})
+                              'fromDoB': 'DoB_sdn'})'''
 
-    res = res[['UniqueID', 'recordID_sdn', 'uid_sdn', 'name_client', 'name_sdn', 'DoB_client', 'DoB_sdn', 'address_client', 'address_sdn', 'country_client',
-               'country_sdn', 'Name_Matching_%', 'score_Name', 'score_DoB', 'score_Address', 'Overall_Score']]
-        
-    return res.query(f'Overall_Score >= {scoreTrsh}').sort_values('Overall_Score', ascending=False)
+
+    res = res.merge(sdn_list_mapping, how='left', left_on='id_sdn', right_on='uid')
+
+    res['review_result'] = np.NaN
+    res['timestamp'] = np.NaN
+
+    res = res[['id_client', 'id_sdn', 'sanction_list_name', 'Overall_Score', 
+    'review_result', 'timestamp',
+    #name
+    'name_client(multi_value)',
+       'name_sdn(multi_value)', 'matching_name_client', 'matching_name_sdn',
+       'Name_Matching_%', 'score_Name', 
+       #DoB
+       'DoB_client(multi_value)',
+       'DoB_sdn(multi_value)', 'matching_DoB_client', 'matching_DoB_sdn',
+       'score_DoB', 
+       # address
+       'Address_client(multi_value)',
+       'Address_sdn(multi_value)', 'matching_address_client',
+       'matching_address_sdn', 'Country_client(multi_value)',
+       'Country_sdn(multi_value)', 'matching_country_client',
+       'matching_country_sdn', 'score_Address']]
+
+    res['max_score'] = res.groupby('id_client')['Overall_Score'].transform('max')
+    res['score_rank'] = res.groupby("id_client")["Overall_Score"].rank("dense", ascending=False)
+    return res.sort_values(by=['max_score', 'id_client', 'score_rank'], ascending=[False,True,True])
